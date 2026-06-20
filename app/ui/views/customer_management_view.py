@@ -1,9 +1,10 @@
 # app/ui/views/customer_management_view.py
 import csv
+import math
 from PySide6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QPushButton, 
-                             QTableWidget, QTableWidgetItem, QHeaderView, 
-                             QDialog, QLabel, QLineEdit, QMessageBox, 
-                             QAbstractItemView, QFileDialog)
+                               QTableWidget, QTableWidgetItem, QHeaderView, 
+                               QDialog, QLabel, QLineEdit, QMessageBox, 
+                               QAbstractItemView, QFileDialog)
 from PySide6.QtCore import Qt, QMarginsF 
 from PySide6.QtGui import QPdfWriter, QTextDocument, QPageLayout, QPageSize
 from app.services.customer_service import CustomerService
@@ -43,7 +44,7 @@ class CustomerFormDialog(QDialog):
         self.mobile_input.setPlaceholderText("e.g. +1234567890")
         layout.addWidget(self.mobile_input)
 
-        layout.addWidget(QLabel("Email Address Address"))
+        layout.addWidget(QLabel("Email Address"))
         self.email_input = QLineEdit()
         self.email_input.setPlaceholderText("e.g. john.doe@enterprise.com")
         layout.addWidget(self.email_input)
@@ -100,6 +101,11 @@ class CustomerManagementView(QWidget):
         self.repo = CustomerRepository(db_session)
         self.service = CustomerService(self.repo)
         
+        # Pagination State
+        self.current_page = 1
+        self.items_per_page = 30
+        self.total_pages = 1
+        
         self.init_ui()
         self.reload_customer_records()
 
@@ -115,42 +121,48 @@ class CustomerManagementView(QWidget):
             QPushButton#secondaryBtn { background-color: #ffffff; color: #4a5568; border: 1px solid #ccd1d9; font-weight: bold; padding: 10px 16px; border-radius: 4px; }
             QPushButton#secondaryBtn:hover { background-color: #edf2f7; }
             QPushButton#inlineEditBtn { background-color: #00adb5; color: white; border: none; padding: 4px 12px; font-weight: bold; font-size: 11px; border-radius: 3px; min-height: 20px; }
+            QPushButton#paginationBtn { background-color: #ffffff; color: #4a5568; border: 1px solid #ccd1d9; font-weight: bold; padding: 6px 12px; border-radius: 4px; }
+            QPushButton#paginationBtn:hover { background-color: #edf2f7; }
+            QPushButton#paginationBtn:disabled { background-color: #f1f3f5; color: #adb5bd; }
         """)
 
         main_layout = QVBoxLayout(self)
         main_layout.setContentsMargins(20, 20, 20, 20)
         main_layout.setSpacing(15)
 
+        # Top Bar
         top_bar = QHBoxLayout()
-        title = QLabel("Customer Relationship Directory Matrix")
+        title = QLabel("Customer List")
         title.setStyleSheet("font-size: 20px; font-weight: bold; color: #2b2d42;")
         top_bar.addWidget(title)
         top_bar.addStretch()
 
-        self.add_customer_btn = QPushButton("Add New Customer")
+        self.add_customer_btn = QPushButton("+ Customer")
         self.add_customer_btn.setObjectName("actionBtn")
         self.add_customer_btn.clicked.connect(self.launch_creation_form)
         top_bar.addWidget(self.add_customer_btn)
 
-        self.export_excel_btn = QPushButton("Export Excel CSV")
+        self.export_excel_btn = QPushButton("Excel CSV")
         self.export_excel_btn.setObjectName("secondaryBtn")
         self.export_excel_btn.clicked.connect(self.export_to_excel_format)
         top_bar.addWidget(self.export_excel_btn)
 
-        self.export_pdf_btn = QPushButton("Export PDF Document")
+        self.export_pdf_btn = QPushButton("PDF")
         self.export_pdf_btn.setObjectName("secondaryBtn")
         self.export_pdf_btn.clicked.connect(self.export_to_pdf_format)
         top_bar.addWidget(self.export_pdf_btn)
 
         main_layout.addLayout(top_bar)
 
+        # Search Bar
         search_layout = QHBoxLayout()
         self.search_input = QLineEdit()
         self.search_input.setPlaceholderText("Search Accounts Matrix: Filter records dynamically via customer name or mobile tags...")
-        self.search_input.textChanged.connect(self.reload_customer_records)
+        self.search_input.textChanged.connect(self.on_filter_changed)
         search_layout.addWidget(self.search_input)
         main_layout.addLayout(search_layout)
 
+        # Data Table
         self.table = QTableWidget()
         self.table.setColumnCount(6)
         self.table.setHorizontalHeaderLabels([
@@ -164,11 +176,62 @@ class CustomerManagementView(QWidget):
         
         main_layout.addWidget(self.table)
 
+        # Pagination Controls
+        pagination_layout = QHBoxLayout()
+        self.prev_btn = QPushButton("<< Previous")
+        self.prev_btn.setObjectName("paginationBtn")
+        self.prev_btn.clicked.connect(self.prev_page)
+        
+        self.page_label = QLabel("Page 1 of 1")
+        self.page_label.setStyleSheet("font-weight: bold; color: #4a5568;")
+        self.page_label.setAlignment(Qt.AlignCenter)
+        
+        self.next_btn = QPushButton("Next >>")
+        self.next_btn.setObjectName("paginationBtn")
+        self.next_btn.clicked.connect(self.next_page)
+        
+        pagination_layout.addStretch()
+        pagination_layout.addWidget(self.prev_btn)
+        pagination_layout.addWidget(self.page_label)
+        pagination_layout.addWidget(self.next_btn)
+        pagination_layout.addStretch()
+        
+        main_layout.addLayout(pagination_layout)
+
+    def on_filter_changed(self):
+        self.current_page = 1
+        self.reload_customer_records()
+
+    def prev_page(self):
+        if self.current_page > 1:
+            self.current_page -= 1
+            self.reload_customer_records()
+
+    def next_page(self):
+        if self.current_page < self.total_pages:
+            self.current_page += 1
+            self.reload_customer_records()
+
     def reload_customer_records(self, *args):
         try:
             self.table.setRowCount(0)
             search_query = self.search_input.text()
-            customers = self.service.get_customers_list(search_query)
+            
+            # Retrieve pagination counts
+            total_records = self.service.get_total_count(search_query)
+            self.total_pages = max(1, math.ceil(total_records / self.items_per_page))
+            
+            # Update Pagination UI
+            self.page_label.setText(f"Page {self.current_page} of {self.total_pages}")
+            self.prev_btn.setEnabled(self.current_page > 1)
+            self.next_btn.setEnabled(self.current_page < self.total_pages)
+
+            # Fetch Sliced Data
+            customers = self.service.get_customers_paginated(
+                search_query, 
+                limit=self.items_per_page, 
+                offset=(self.current_page - 1) * self.items_per_page
+            )
             
             for row_idx, cust in enumerate(customers):
                 self.table.insertRow(row_idx)
@@ -241,6 +304,7 @@ class CustomerManagementView(QWidget):
             return
 
         try:
+            # For exports, generally you want the unpaginated list 
             customers = self.service.get_customers_list(self.search_input.text())
             with open(path, mode='w', newline='', encoding='utf-8') as file:
                 writer = csv.writer(file, dialect='excel')
@@ -260,6 +324,7 @@ class CustomerManagementView(QWidget):
             return
 
         try:
+            # For exports, generally you want the unpaginated list
             customers = self.service.get_customers_list(self.search_input.text())
             
             html_content = """

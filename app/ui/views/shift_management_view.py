@@ -1,11 +1,12 @@
 # app/ui/views/shift_management_view.py
+import math
 from datetime import datetime
 from decimal import Decimal
 from PySide6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QPushButton, 
-                             QTableWidget, QTableWidgetItem, QHeaderView,
-                             QDialog, QLabel, QComboBox, QMessageBox, 
-                             QAbstractItemView, QDoubleSpinBox, QFormLayout, 
-                             QDateEdit, QCheckBox)
+                               QTableWidget, QTableWidgetItem, QHeaderView,
+                               QDialog, QLabel, QComboBox, QMessageBox, 
+                               QAbstractItemView, QDoubleSpinBox, QFormLayout, 
+                               QDateEdit, QCheckBox)
 from PySide6.QtCore import Qt, QDate
 from sqlalchemy import func
 
@@ -131,6 +132,12 @@ class ShiftManagementView(QWidget):
         super().__init__()
         self.current_user = user
         self.db_session = db_session
+        
+        # Pagination State
+        self.current_page = 1
+        self.items_per_page = 30
+        self.total_pages = 1
+        
         self.init_ui()
         self.load_filters()
         self.refresh_shift_table()
@@ -153,7 +160,7 @@ class ShiftManagementView(QWidget):
         # --- Filters ---
         filter_layout = QHBoxLayout()
         self.use_date_cb = QCheckBox("Filter by Date:")
-        self.use_date_cb.stateChanged.connect(self.refresh_shift_table)
+        self.use_date_cb.stateChanged.connect(self.on_filter_changed)
         filter_layout.addWidget(self.use_date_cb)
         
         self.date_filter = QDateEdit()
@@ -161,18 +168,18 @@ class ShiftManagementView(QWidget):
         self.date_filter.setDate(QDate.currentDate())
         self.date_filter.setEnabled(False)
         self.use_date_cb.toggled.connect(self.date_filter.setEnabled)
-        self.date_filter.dateChanged.connect(self.refresh_shift_table)
+        self.date_filter.dateChanged.connect(self.on_filter_changed)
         filter_layout.addWidget(self.date_filter)
 
         filter_layout.addWidget(QLabel("User:"))
         self.user_combo = QComboBox()
-        self.user_combo.currentIndexChanged.connect(self.refresh_shift_table)
+        self.user_combo.currentIndexChanged.connect(self.on_filter_changed)
         filter_layout.addWidget(self.user_combo)
 
         filter_layout.addWidget(QLabel("Status:"))
         self.status_combo = QComboBox()
         self.status_combo.addItems(["ALL", "OPEN", "CLOSED"])
-        self.status_combo.currentIndexChanged.connect(self.refresh_shift_table)
+        self.status_combo.currentIndexChanged.connect(self.on_filter_changed)
         filter_layout.addWidget(self.status_combo)
         
         top_bar_layout.addLayout(filter_layout)
@@ -211,6 +218,29 @@ class ShiftManagementView(QWidget):
         info_footer = QLabel("<i>* Double-click a row to view payment details for that shift.</i>")
         info_footer.setStyleSheet("color: #6c757d;")
         layout.addWidget(info_footer)
+        
+        ## 3. Pagination Controls
+        pagination_layout = QHBoxLayout()
+        
+        self.prev_btn = QPushButton("<< Previous")
+        self.prev_btn.setFixedWidth(100)
+        self.prev_btn.clicked.connect(self.prev_page)
+        
+        self.page_label = QLabel("Page 1 of 1")
+        self.page_label.setAlignment(Qt.AlignCenter)
+        self.page_label.setStyleSheet("font-weight: bold; color: #2b2d42;")
+        
+        self.next_btn = QPushButton("Next >>")
+        self.next_btn.setFixedWidth(100)
+        self.next_btn.clicked.connect(self.next_page)
+        
+        pagination_layout.addStretch()
+        pagination_layout.addWidget(self.prev_btn)
+        pagination_layout.addWidget(self.page_label)
+        pagination_layout.addWidget(self.next_btn)
+        pagination_layout.addStretch()
+        
+        layout.addLayout(pagination_layout)
 
     def load_filters(self):
         self.user_combo.blockSignals(True)
@@ -224,6 +254,21 @@ class ShiftManagementView(QWidget):
             print(f"Failed to load users: {e}")
         finally:
             self.user_combo.blockSignals(False)
+
+    def on_filter_changed(self):
+        """Reset pagination when filters change."""
+        self.current_page = 1
+        self.refresh_shift_table()
+
+    def prev_page(self):
+        if self.current_page > 1:
+            self.current_page -= 1
+            self.refresh_shift_table()
+
+    def next_page(self):
+        if self.current_page < self.total_pages:
+            self.current_page += 1
+            self.refresh_shift_table()
 
     def refresh_shift_table(self):
         self.shift_table.setRowCount(0)
@@ -242,7 +287,26 @@ class ShiftManagementView(QWidget):
             query = query.filter(Shift.status == status)
 
         try:
-            shifts = query.order_by(Shift.created_at.desc()).all()
+            # ---------------------------------------------------------
+            # Pagination Calculation & Query Execution
+            # ---------------------------------------------------------
+            total_records = query.count()
+            self.total_pages = max(1, math.ceil(total_records / self.items_per_page))
+            
+            # Boundary check in case records were deleted
+            if self.current_page > self.total_pages:
+                self.current_page = self.total_pages
+
+            # Update pagination UI
+            self.page_label.setText(f"Page {self.current_page} of {self.total_pages} (Total: {total_records})")
+            self.prev_btn.setEnabled(self.current_page > 1)
+            self.next_btn.setEnabled(self.current_page < self.total_pages)
+
+            # Fetch the actual chunk of data based on current page
+            shifts = query.order_by(Shift.created_at.desc()) \
+                          .offset((self.current_page - 1) * self.items_per_page) \
+                          .limit(self.items_per_page).all()
+            
             for idx, shift in enumerate(shifts):
                 self.shift_table.insertRow(idx)
                 
@@ -300,7 +364,7 @@ class ShiftManagementView(QWidget):
             
             QMessageBox.information(self, "Success", f"New shift started successfully!")
             self.status_combo.setCurrentText("OPEN")
-            self.refresh_shift_table()
+            self.on_filter_changed()  # Reset page and refresh
 
         except Exception as e:
             self.db_session.rollback()

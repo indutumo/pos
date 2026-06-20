@@ -1,4 +1,3 @@
-# app/services/stocktake_service.py
 from app.models.schema import StockTake, Product, User
 from app.repositories.stocktake_repo import StockTakeRepository
 
@@ -10,6 +9,14 @@ class StockTakeService:
         ALLOWED_ROLES = ["ADMIN", "MANAGE_STOCK"]
         if not current_user or current_user.role.role_name not in ALLOWED_ROLES:
             raise PermissionError("Access Denied: This operational window requires Management or Admin security clearance.")
+
+    def get_total_count(self, current_user: User, search_query: str = "") -> int:
+        self._verify_clearance(current_user)
+        return self.stocktake_repo.get_total_count(search_query)
+
+    def get_stocktakes_paginated(self, current_user: User, search_query: str = "", limit: int = 30, offset: int = 0):
+        self._verify_clearance(current_user)
+        return self.stocktake_repo.get_paginated(search_query, limit, offset)
 
     def get_stocktakes_list(self, current_user: User, search_query: str = None):
         self._verify_clearance(current_user)
@@ -41,12 +48,9 @@ class StockTakeService:
             user_id=current_user.id
         )
 
-        # =================================================================
-        # FIXED: Explicitly flag product instance state change for persistence
-        # =================================================================
         product.quantity = actual_quantity
         session.add(product)  
         
         self.stocktake_repo.add(new_audit_record)
-        self.stocktake_repo.commit()  # Commits both product mutation and stocktake logging safely
+        self.stocktake_repo.commit()
         return new_audit_record

@@ -1,139 +1,198 @@
-# app/ui/views/dashboard_view.py
+from PySide6.QtWidgets import (
+    QWidget, QVBoxLayout, QHBoxLayout, 
+    QLabel, QFrame, QTableWidget, QTableWidgetItem, QHeaderView
+)
+from PySide6.QtCore import Qt, QTimer, QMargins
+from PySide6.QtCharts import QChart, QChartView, QBarSeries, QBarSet, QBarCategoryAxis, QValueAxis
+from PySide6.QtGui import QPainter, QColor
+from sqlalchemy import func, desc
+from datetime import datetime, timedelta
+from app.models.schema import Sale, Product, BillReceipt, ReceiptStatus
 
-from PySide6.QtWidgets import QMainWindow, QWidget, QHBoxLayout, QVBoxLayout, QPushButton, QLabel, QStackedWidget, QStatusBar
-from PySide6.QtCore import Qt
-from app.ui.views.user_management_view import UserManagementView
-from app.ui.views.product_management_view import ProductManagementView
-from app.ui.views.customer_management_view import CustomerManagementView
-from app.ui.views.stocktake_management_view import StockTakeManagementView 
-from app.ui.views.sales_terminal_management_view import SalesTerminalManagementView 
-# INJECTED: Import the newly minted Shift Tracking UI frame 
-from app.ui.views.shift_management_view import ShiftManagementView
-from app.core.database import SessionLocal
+class KPICard(QFrame):
+    def __init__(self, title, value, color):
+        super().__init__()
+        self.setStyleSheet(f"""
+            QFrame {{ background-color: #ffffff; border-radius: 10px; border: 1px solid #e1e4e8; }}
+            QLabel#Title {{ color: #718096; font-size: 12px; font-weight: 600; padding: 10px 15px 0 15px; }}
+            QLabel#Value {{ color: #2b2d42; font-size: 22px; font-weight: bold; padding: 5px 15px 15px 15px; }}
+        """)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        self.title_lbl = QLabel(title); self.title_lbl.setObjectName("Title")
+        self.val_lbl = QLabel(value); self.val_lbl.setObjectName("Value")
+        layout.addWidget(self.title_lbl); layout.addWidget(self.val_lbl)
 
-class DashboardWindow(QMainWindow):
-    def __init__(self, user):
+    def update_value(self, value):
+        self.val_lbl.setText(value)
+
+class DashboardView(QWidget):
+    def __init__(self, user, db_session):
         super().__init__()
         self.user = user
-        self.db_session = SessionLocal() 
-        self.setWindowTitle(f"Zola POS Core Enterprise Suite: {self.user.username}")
-        self.resize(1150, 750)
+        self.db = db_session
         self.init_ui()
+        
+        self.timer = QTimer(self)
+        self.timer.timeout.connect(self.refresh_dashboard)
+        self.timer.start(30000)
 
     def init_ui(self):
-        # Base Layout Theme Config
-        self.setStyleSheet("""
-            QMainWindow { background-color: #f8f9fa; }
-            QWidget#sidebar { background-color: #ffffff; border-right: 1px solid #e1e4e8; min-width: 220px; max-width: 220px; }
-            QLabel#logoLabel { color: #00adb5; font-size: 20px; font-weight: bold; padding: 20px 10px; }
-            QWidget#mainContent { background-color: #f8f9fa; }
-            QLabel#viewTitle { color: #2b2d42; font-size: 24px; font-weight: bold; }
-        """)
+        self.main_layout = QVBoxLayout(self)
+        self.main_layout.setContentsMargins(25, 25, 25, 25)
+        self.main_layout.setSpacing(20)
 
-        central_widget = QWidget()
-        self.setCentralWidget(central_widget)
-        main_layout = QHBoxLayout(central_widget)
-        main_layout.setContentsMargins(0, 0, 0, 0)
-        main_layout.setSpacing(0)
-
-        # Sidebar Assembly
-        sidebar = QWidget()
-        sidebar.setObjectName("sidebar")
-        sidebar_layout = QVBoxLayout(sidebar)
-        sidebar_layout.setContentsMargins(0, 0, 0, 0)
-        sidebar_layout.setAlignment(Qt.AlignTop)
-
-        logo = QLabel("Zola POS")
-        logo.setObjectName("logoLabel")
-        logo.setAlignment(Qt.AlignCenter)
-        sidebar_layout.addWidget(logo)
-
-        self.menu_buttons = {}
+        # 1. KPI Header
+        self.kpi_row = QHBoxLayout()
+        stats = self.get_kpi_stats()
+        self.card_sales = KPICard("Today's Sales", f"KES {stats['sales']:,.2f}", "#00adb5")
+        self.card_pending = KPICard("Pending Receipts", f"{stats['pending']:,}", "#f39c12")
+        self.card_low = KPICard("Low Stock Items", f"{stats['low_stock']:,}", "#e74c3c")
         
-        # Navigation Routing Role Configuration Scheme
-        # UPDATED: Added "Shift Ledger" allowing access across ALL standard organizational structures
-        navigation_schema = [
-            ("Dashboard", ["ADMIN", "CASHIER", "MANAGE_STOCK"]),
-            ("Sales Terminal", ["ADMIN", "CASHIER"]),
-            ("Shift Ledger", ["ADMIN", "CASHIER", "MANAGE_STOCK"]),
-            ("Inventory Manager", ["ADMIN", "CASHIER", "MANAGE_STOCK"]), 
-            ("Customer Manager", ["ADMIN", "CASHIER", "MANAGE_STOCK"]),  
-            ("Stock Take Audit", ["ADMIN", "MANAGE_STOCK"]),
-            ("Analytics & Reports", ["ADMIN"]),
-            ("System Users", ["ADMIN"]), 
-        ]
+        self.kpi_row.addWidget(self.card_sales)
+        self.kpi_row.addWidget(self.card_pending)
+        self.kpi_row.addWidget(self.card_low)
+        self.main_layout.addLayout(self.kpi_row)
 
-        user_role_str = self.user.role.role_name
+        # 2. Main Content
+        self.body_layout = QHBoxLayout()
+        self.body_layout.setSpacing(20)
         
-        for view_name, allowed_roles in navigation_schema:
-            if user_role_str in allowed_roles or view_name == "Sales Terminal":
-                btn = QPushButton(view_name)
-                btn.setCheckable(True)
-                btn.setAutoExclusive(True)
-                btn.setCursor(Qt.PointingHandCursor)
-                btn.setStyleSheet("""
-                    QPushButton { background-color: transparent; color: #4a5568; border: none; text-align: left; padding: 12px 20px; font-size: 14px; margin: 2px 10px; }
-                    QPushButton:hover { background-color: #edf2f7; color: #1a202c; border-radius: 4px; }
-                    QPushButton:checked { background-color: #00adb5; color: white; font-weight: bold; border-radius: 4px; }
-                """)
-                sidebar_layout.addWidget(btn)
-                self.menu_buttons[view_name] = btn
-
-        sidebar_layout.addStretch()
+        self.chart_container = QVBoxLayout()
+        self.tables_container = QVBoxLayout()
+        self.tables_container.setSpacing(15)
         
-        self.logout_btn = QPushButton("Sign Out")
-        self.logout_btn.setStyleSheet("color: #e53e3e; border: 1px solid #e53e3e; background-color: transparent; margin: 15px; padding: 8px; border-radius: 4px; font-weight: bold;")
-        sidebar_layout.addWidget(self.logout_btn)
-        main_layout.addWidget(sidebar)
-
-        # Content Workspace Engine Layout Setup
-        content_area = QWidget()
-        content_area.setObjectName("mainContent")
-        content_layout = QVBoxLayout(content_area)
+        self.body_layout.addLayout(self.chart_container, stretch=1)
+        self.body_layout.addLayout(self.tables_container, stretch=1)
+        self.main_layout.addLayout(self.body_layout)
         
-        self.view_stack = QStackedWidget()
+        self.refresh_dashboard()
 
-        # Dynamic View Loading Switch Matrix Loop Engine
-        for view_title in self.menu_buttons.keys():
-            if view_title == "System Users":
-                workspace_page = UserManagementView(self.user, self.db_session)
-            elif view_title == "Inventory Manager":
-                workspace_page = ProductManagementView(self.user, self.db_session)
-            elif view_title == "Customer Manager":
-                workspace_page = CustomerManagementView(self.user, self.db_session)
-            elif view_title == "Stock Take Audit":
-                workspace_page = StockTakeManagementView(self.user, self.db_session)
-            elif view_title == "Sales Terminal":
-                workspace_page = SalesTerminalManagementView(self.user, self.db_session)
-            # INJECTED: Route workspace execution to generate matching view class
-            elif view_title == "Shift Ledger":
-                workspace_page = ShiftManagementView(self.user, self.db_session)
+    def refresh_dashboard(self):
+        self.db.expire_all()
+        stats = self.get_kpi_stats()
+        self.card_sales.update_value(f"KES {stats['sales']:,.2f}")
+        self.card_pending.update_value(f"{stats['pending']:,}")
+        self.card_low.update_value(f"{stats['low_stock']:,}")
+        
+        self.update_chart()
+        self.update_tables()
+
+    def update_chart(self):
+        while self.chart_container.count():
+            item = self.chart_container.takeAt(0)
+            if item.widget(): item.widget().deleteLater()
+            
+        frame = QFrame()
+        frame.setStyleSheet("background-color: white; border-radius: 10px; border: 1px solid #e1e4e8;")
+        layout = QVBoxLayout(frame)
+        layout.setContentsMargins(15, 15, 15, 15)
+        layout.addWidget(QLabel("<b>Sales Trend (Last 7 Days)</b>"))
+        
+        series = QBarSeries()
+        bar_set = QBarSet("Revenue")
+        bar_set.setColor(QColor("#00adb5"))
+        
+        data = self.get_trend_data()
+        categories = []
+        for date_obj, total in data:
+            bar_set.append(float(total))
+            categories.append(date_obj.strftime("%d/%m"))
+        
+        series.append(bar_set)
+        chart = QChart()
+        chart.addSeries(series)
+        chart.setBackgroundBrush(QColor("transparent"))
+        chart.setMargins(QMargins(0, 0, 0, 0))
+        
+        axis_x = QBarCategoryAxis()
+        axis_x.append(categories)
+        chart.addAxis(axis_x, Qt.AlignBottom)
+        series.attachAxis(axis_x)
+        
+        axis_y = QValueAxis()
+        axis_y.setLabelFormat("%.0f") # Numeric clean formatting
+        chart.addAxis(axis_y, Qt.AlignLeft)
+        series.attachAxis(axis_y)
+        
+        chart_view = QChartView(chart)
+        chart_view.setRenderHint(QPainter.Antialiasing)
+        chart_view.setStyleSheet("background-color: transparent;")
+        layout.addWidget(chart_view)
+        
+        self.chart_container.addWidget(frame)
+
+    def update_tables(self):
+        while self.tables_container.count():
+            item = self.tables_container.takeAt(0)
+            if item.widget(): item.widget().deleteLater()
+            
+        self.tables_container.addWidget(self.create_modern_table("Top Fast Moving", ["Product", "Qty"], self.get_top_products()))
+        self.tables_container.addWidget(self.create_modern_table("Low Stock Alert", ["Product", "Qty"], self.get_low_stock()))
+
+    def create_modern_table(self, title, headers, data):
+        container = QFrame()
+        container.setStyleSheet("background-color: white; border-radius: 10px; border: 1px solid #e1e4e8;")
+        vbox = QVBoxLayout(container)
+        vbox.setContentsMargins(15, 15, 15, 15)
+        vbox.addWidget(QLabel(f"<b>{title}</b>"))
+        
+        table = QTableWidget()
+        table.setColumnCount(2)
+        table.setHorizontalHeaderLabels(headers)
+        
+        # Explicit Header Alignment
+        header = table.horizontalHeader()
+        header.setSectionResizeMode(0, QHeaderView.Stretch)
+        header.setSectionResizeMode(1, QHeaderView.Fixed)
+        table.setColumnWidth(1, 80)
+        
+        # Set alignment on individual header items
+        for i in range(2):
+            item = table.horizontalHeaderItem(i)
+            if i == 0:
+                item.setTextAlignment(Qt.AlignLeft | Qt.AlignVCenter)
             else:
-                workspace_page = QWidget()
-                lbl_layout = QVBoxLayout(workspace_page)
-                lbl = QLabel(f"Welcome to {view_title} System Space Workspace")
-                lbl.setObjectName("viewTitle")
-                lbl.setAlignment(Qt.AlignCenter)
-                lbl_layout.addWidget(lbl)
+                item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
 
-            self.view_stack.addWidget(workspace_page)
-            self.menu_buttons[view_title].clicked.connect(self.make_switch_callback(view_title, self.view_stack.count() - 1))
+        table.setShowGrid(False)
+        table.setStyleSheet("""
+            QTableWidget { border: none; font-size: 13px; }
+            QHeaderView::section { background: white; border: none; border-bottom: 2px solid #edf2f7; padding: 8px; color: #718096; font-weight: bold; }
+            QTableWidget::item { padding: 8px; border-bottom: 1px solid #edf2f7; }
+        """)
+        
+        table.setRowCount(len(data))
+        for r, (name, val) in enumerate(data):
+            # Column 0: Product Name (Left Aligned)
+            item_name = QTableWidgetItem(str(name))
+            item_name.setTextAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+            table.setItem(r, 0, item_name)
+            
+            # Column 1: Qty (Right Aligned)
+            val_item = QTableWidgetItem(f"{val:,}") 
+            val_item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+            table.setItem(r, 1, val_item)
+            
+        vbox.addWidget(table)
+        return container
 
-        content_layout.addWidget(self.view_stack)
-        main_layout.addWidget(content_area)
+    def get_kpi_stats(self):
+        today = datetime.utcnow().date()
+        sales = self.db.query(func.sum(Sale.quantity * Sale.price)).filter(func.date(Sale.sale_date) == today).scalar() or 0
+        pending = self.db.query(BillReceipt).filter(BillReceipt.status == ReceiptStatus.PENDING).count()
+        low_stock = self.db.query(Product).filter(Product.quantity < 10).count()
+        return {"sales": sales, "pending": pending, "low_stock": low_stock}
 
-        # Status Footer Infrastructure
-        self.status_bar = QStatusBar()
-        self.status_bar.setStyleSheet("color: #4a5568; background-color: #ffffff; border-top: 1px solid #e1e4e8;")
-        self.setStatusBar(self.status_bar)
-        self.status_bar.showMessage(f"Operator: {self.user.name} | Security clearance level: [{user_role_str}]")
+    def get_trend_data(self):
+        seven_days_ago = datetime.utcnow() - timedelta(days=7)
+        return self.db.query(func.date(Sale.sale_date), func.sum(Sale.quantity * Sale.price))\
+                      .filter(Sale.sale_date >= seven_days_ago)\
+                      .group_by(func.date(Sale.sale_date))\
+                      .order_by(func.date(Sale.sale_date)).all()
 
-        if self.menu_buttons:
-            list(self.menu_buttons.values())[0].setChecked(True)
+    def get_top_products(self):
+        return self.db.query(Product.name, func.sum(Sale.quantity)).join(Sale).group_by(Product.id).order_by(desc(func.sum(Sale.quantity))).limit(5).all()
 
-    def make_switch_callback(self, name, index):
-        return lambda: self.view_stack.setCurrentIndex(index)
-
-    def closeEvent(self, event):
-        self.db_session.close()
-        event.accept()
+    def get_low_stock(self):
+        return self.db.query(Product.name, Product.quantity).filter(Product.quantity < 10).limit(5).all()

@@ -164,24 +164,24 @@ class UserManagementView(QWidget):
         main_layout.setSpacing(15)
 
         top_bar = QHBoxLayout()
-        title = QLabel("System Operators Management Matrix")
+        title = QLabel("System List")
         title.setStyleSheet("font-size: 20px; font-weight: bold; color: #2b2d42;")
         top_bar.addWidget(title)
         top_bar.addStretch()
 
-        self.add_user_btn = QPushButton("Provision New Operator")
+        self.add_user_btn = QPushButton("+ User")
         self.add_user_btn.setObjectName("actionBtn")
         self.add_user_btn.setCursor(Qt.PointingHandCursor)
         self.add_user_btn.clicked.connect(self.launch_creation_form)
         top_bar.addWidget(self.add_user_btn)
 
-        self.edit_user_btn = QPushButton("Edit Operator Details")
+        self.edit_user_btn = QPushButton("Edit User")
         self.edit_user_btn.setObjectName("secondaryBtn")
         self.edit_user_btn.setCursor(Qt.PointingHandCursor)
         self.edit_user_btn.clicked.connect(self.launch_edit_form)
         top_bar.addWidget(self.edit_user_btn)
 
-        self.toggle_status_btn = QPushButton("Toggle Activation Status")
+        self.toggle_status_btn = QPushButton("Update Status")
         self.toggle_status_btn.setObjectName("toggleBtn")
         self.toggle_status_btn.setCursor(Qt.PointingHandCursor)
         self.toggle_status_btn.clicked.connect(self.execute_status_toggle)

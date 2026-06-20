@@ -9,8 +9,9 @@ from PySide6.QtWidgets import (
     QTableWidget, QTableWidgetItem, QHeaderView, QTabWidget,
     QDialog, QLabel, QComboBox, QMessageBox, QLineEdit,
     QAbstractItemView, QSpinBox, QDoubleSpinBox, QFormLayout,
+    QFrame, QListWidget, QListWidgetItem,
 )
-from PySide6.QtCore import Qt
+from PySide6.QtCore import Qt, QSize, QEvent, QPoint, QTimer, Signal
 from PySide6.QtGui import QTextDocument
 from PySide6.QtPrintSupport import QPrinter, QPrintDialog
 
@@ -82,6 +83,337 @@ class PaginationBar(QWidget):
     # Reset to page 1 (e.g. when the search text changes)
     def reset(self):
         self.current_page = 1
+
+
+# ====================================================================
+# Reusable Product Search Widget (type-ahead, rich result rows)
+# ====================================================================
+class ProductSearchWidget(QWidget):
+    """
+    A modern, type-ahead product picker.
+
+    The user types a few characters of a product's name or barcode and
+    is shown a live-filtered popup of matches. Each row displays the
+    product name, barcode, a colour-coded stock badge, and price, so
+    the cashier can confirm availability without leaving the field.
+
+    Usage:
+        self.product_search = ProductSearchWidget()
+        self.product_search.set_products(product_dicts)
+        self.product_search.productSelected.connect(self.on_product_picked)
+        ...
+        product_id = self.product_search.selected_product_id()
+
+    `product_dicts` is a list of dicts shaped like:
+        {"id": ..., "name": ..., "barcode": ..., "quantity": ..., "price": ...}
+    """
+
+    productSelected = Signal(object)  # emits product_id, or None when cleared
+    LOW_STOCK_THRESHOLD = 5
+    # Soft cap purely to protect rendering performance on huge catalogues —
+    # the popup itself grows to fit every match with no inner scrolling
+    # as long as it fits on screen (see _show_popup).
+    MAX_RESULTS = 100
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._all_products = []
+        self._filtered = []
+        self._selected_id = None
+        self._highlighted_row = -1
+
+        self._build_ui()
+        self._build_popup()
+
+    # ------------------------------------------------------------------
+    # Construction
+    # ------------------------------------------------------------------
+    def _build_ui(self):
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(2)
+
+        self.search_input = QLineEdit()
+        self.search_input.setPlaceholderText("Search by product name or barcode…")
+        self.search_input.setClearButtonEnabled(True)
+        self.search_input.textEdited.connect(self._on_text_edited)
+        self.search_input.installEventFilter(self)
+        layout.addWidget(self.search_input)
+
+        self.selection_lbl = QLabel("No product selected")
+        self.selection_lbl.setStyleSheet(self._idle_label_style())
+        layout.addWidget(self.selection_lbl)
+
+    def _build_popup(self):
+        # A frameless, top-level popup positioned under the search field.
+        # Qt.Popup automatically closes itself on an outside click or Escape.
+        self.popup = QFrame(None, Qt.Popup)
+        self.popup.setObjectName("ProductSearchPopup")
+        self.popup.setStyleSheet("""
+            #ProductSearchPopup {
+                background: white;
+                border: 1px solid #d0d4d9;
+                border-radius: 8px;
+            }
+        """)
+        popup_layout = QVBoxLayout(self.popup)
+        popup_layout.setContentsMargins(4, 4, 4, 4)
+        popup_layout.setSpacing(0)
+
+        self.results_list = QListWidget()
+        self.results_list.setFocusPolicy(Qt.NoFocus)
+        self.results_list.setMouseTracking(True)
+        self.results_list.viewport().setMouseTracking(True)
+        self.results_list.setVerticalScrollMode(QAbstractItemView.ScrollPerPixel)
+        self.results_list.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.results_list.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.results_list.setStyleSheet("""
+            QListWidget { border: none; outline: none; background: transparent; }
+            QListWidget::item { border-radius: 6px; margin: 1px 0; }
+            QListWidget::item:hover { background: #f3f6f8; }
+            QListWidget::item:selected { background: #e6f9fa; }
+        """)
+        self.results_list.itemClicked.connect(self._on_item_clicked)
+        self.results_list.itemEntered.connect(self._on_item_hovered)
+        popup_layout.addWidget(self.results_list)
+
+        self.empty_lbl = QLabel("No matching products")
+        self.empty_lbl.setAlignment(Qt.AlignCenter)
+        self.empty_lbl.setStyleSheet("color: #8a8f98; padding: 16px; font-size: 12px;")
+        self.empty_lbl.hide()
+        popup_layout.addWidget(self.empty_lbl)
+
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
+    def set_products(self, products):
+        """Load/refresh the searchable catalogue and reset any selection."""
+        self._all_products = products
+        self.clear_selection()
+
+    def selected_product_id(self):
+        return self._selected_id
+
+    def clear_selection(self):
+        self._selected_id = None
+        self._filtered = []
+        self.search_input.blockSignals(True)
+        self.search_input.clear()
+        self.search_input.blockSignals(False)
+        self.selection_lbl.setText("No product selected")
+        self.selection_lbl.setStyleSheet(self._idle_label_style())
+        self._hide_popup()
+
+    # ------------------------------------------------------------------
+    # Filtering & popup rendering
+    # ------------------------------------------------------------------
+    def _on_text_edited(self, text):
+        self._selected_id = None
+        query = text.strip().lower()
+
+        if not query:
+            self._filtered = []
+            self._hide_popup()
+            self.selection_lbl.setText("No product selected")
+            self.selection_lbl.setStyleSheet(self._idle_label_style())
+            self.productSelected.emit(None)
+            return
+
+        self._filtered = [
+            p for p in self._all_products
+            if query in p["name"].lower() or query in str(p.get("barcode") or "").lower()
+        ][:self.MAX_RESULTS]
+
+        self.selection_lbl.setText("No product selected")
+        self.selection_lbl.setStyleSheet(self._idle_label_style())
+        self._populate_results()
+        self._show_popup()
+
+    def _populate_results(self):
+        self.results_list.clear()
+        self._highlighted_row = -1
+
+        if not self._filtered:
+            self.results_list.hide()
+            self.empty_lbl.show()
+            return
+
+        self.results_list.show()
+        self.empty_lbl.hide()
+
+        row_width = max(self.search_input.width(), 320)
+        for product in self._filtered:
+            item = QListWidgetItem()
+            item.setData(Qt.UserRole, product["id"])
+            item.setSizeHint(QSize(row_width, 56))
+            self.results_list.addItem(item)
+            self.results_list.setItemWidget(item, self._make_row_widget(product))
+
+        self.results_list.setCurrentRow(-1)
+
+    def _make_row_widget(self, product):
+        row = QWidget()
+        h = QHBoxLayout(row)
+        h.setContentsMargins(10, 6, 10, 6)
+        h.setSpacing(10)
+
+        text_box = QVBoxLayout()
+        text_box.setSpacing(1)
+        name_lbl = QLabel(product["name"])
+        name_lbl.setStyleSheet("font-weight: 600; font-size: 13px; color: #2b2d42;")
+        barcode_text = f"Barcode: {product['barcode']}" if product.get("barcode") else "No barcode"
+        barcode_lbl = QLabel(barcode_text)
+        barcode_lbl.setStyleSheet("font-size: 11px; color: #8a8f98;")
+        text_box.addWidget(name_lbl)
+        text_box.addWidget(barcode_lbl)
+        h.addLayout(text_box, 1)
+
+        bg, fg, badge_text = self._stock_badge_style(product["quantity"])
+        stock_lbl = QLabel(badge_text)
+        stock_lbl.setAlignment(Qt.AlignCenter)
+        stock_lbl.setStyleSheet(f"""
+            background: {bg}; color: {fg};
+            font-size: 10px; font-weight: 700;
+            padding: 3px 9px; border-radius: 8px;
+        """)
+
+        price_lbl = QLabel(f"${product['price']:.2f}")
+        price_lbl.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        price_lbl.setStyleSheet("font-size: 13px; font-weight: 700; color: #00adb5;")
+
+        right_box = QVBoxLayout()
+        right_box.setSpacing(3)
+        right_box.addWidget(stock_lbl, 0, Qt.AlignRight)
+        right_box.addWidget(price_lbl, 0, Qt.AlignRight)
+        h.addLayout(right_box)
+
+        return row
+
+    def _stock_badge_style(self, stock):
+        if stock <= 0:
+            return "#fde2e1", "#c0392b", "Out of stock"
+        if stock <= self.LOW_STOCK_THRESHOLD:
+            return "#fdf3d8", "#b8860b", f"{stock} left"
+        return "#e3f6e8", "#2a9d6f", f"{stock} in stock"
+
+    def _idle_label_style(self):
+        return "color: #8a8f98; font-size: 11px; padding-left: 2px;"
+
+    # ------------------------------------------------------------------
+    # Popup show / hide / position
+    # ------------------------------------------------------------------
+    def _show_popup(self):
+        anchor_bottom = self.search_input.mapToGlobal(self.search_input.rect().bottomLeft())
+        anchor_top = self.search_input.mapToGlobal(self.search_input.rect().topLeft())
+        width = max(self.search_input.width(), 320)
+        self.popup.setFixedWidth(width)
+
+        row_count = len(self._filtered)
+        content_height = (56 * row_count) + 16 if self._filtered else 60
+
+        screen = self.search_input.screen()
+        screen_rect = screen.availableGeometry() if screen else None
+
+        if screen_rect is None:
+            # No screen info yet (widget not realized) — just show every
+            # row below the field at full height.
+            self.results_list.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+            self.popup.setFixedHeight(content_height)
+            self.popup.move(anchor_bottom)
+            self.popup.show()
+            self.popup.raise_()
+            return
+
+        space_below = screen_rect.bottom() - anchor_bottom.y()
+        space_above = anchor_top.y() - screen_rect.top()
+        show_below = content_height <= space_below or space_below >= space_above
+
+        if show_below:
+            final_height = min(content_height, max(space_below - 8, 60))
+            target_pos = anchor_bottom
+        else:
+            # Not enough room below the field — flip the popup above it
+            # instead of cramming results into a tiny scrollable strip.
+            final_height = min(content_height, max(space_above - 8, 60))
+            target_pos = anchor_top - QPoint(0, final_height)
+
+        # Only fall back to an inner scrollbar if even the full screen
+        # can't fit every match — otherwise every row is shown at once.
+        fits_without_scroll = final_height >= content_height
+        self.results_list.setVerticalScrollBarPolicy(
+            Qt.ScrollBarAlwaysOff if fits_without_scroll else Qt.ScrollBarAsNeeded
+        )
+
+        self.popup.setFixedHeight(final_height)
+        self.popup.move(target_pos)
+        self.popup.show()
+        self.popup.raise_()
+
+    def _hide_popup(self):
+        self.popup.hide()
+
+    # ------------------------------------------------------------------
+    # Selection handling
+    # ------------------------------------------------------------------
+    def _on_item_clicked(self, item):
+        product_id = item.data(Qt.UserRole)
+        product = next((p for p in self._filtered if p["id"] == product_id), None)
+        if product:
+            self._select_product(product)
+
+    def _on_item_hovered(self, item):
+        self._highlighted_row = self.results_list.row(item)
+
+    def _select_product(self, product):
+        self._selected_id = product["id"]
+
+        self.search_input.blockSignals(True)
+        self.search_input.setText(product["name"])
+        self.search_input.blockSignals(False)
+        self.search_input.selectAll()
+        self._hide_popup()
+
+        bg, fg, _ = self._stock_badge_style(product["quantity"])
+        self.selection_lbl.setText(f"Selected • {product['quantity']} in stock • ${product['price']:.2f}")
+        self.selection_lbl.setStyleSheet(f"color: {fg}; font-size: 11px; font-weight: 700; padding-left: 2px;")
+
+        self.productSelected.emit(product["id"])
+
+    # ------------------------------------------------------------------
+    # Keyboard navigation (Up / Down / Enter / Escape)
+    # ------------------------------------------------------------------
+    def eventFilter(self, obj, event):
+        if obj is self.search_input and event.type() == QEvent.FocusIn:
+            # Select all existing text on focus: typing replaces it to
+            # continue/refine the search, and Backspace/Delete clears it
+            # in a single press, rather than needing manual select-all first.
+            QTimer.singleShot(0, self.search_input.selectAll)
+            return False
+
+        if obj is self.search_input and event.type() == QEvent.KeyPress:
+            key = event.key()
+
+            if key in (Qt.Key_Down, Qt.Key_Up) and self.popup.isVisible() and self._filtered:
+                self._move_highlight(1 if key == Qt.Key_Down else -1)
+                return True
+
+            if key in (Qt.Key_Return, Qt.Key_Enter):
+                if self.popup.isVisible() and self._filtered:
+                    row = self._highlighted_row if self._highlighted_row >= 0 else 0
+                    self._select_product(self._filtered[row])
+                    return True
+
+            if key == Qt.Key_Escape and self.popup.isVisible():
+                self._hide_popup()
+                return True
+
+        return super().eventFilter(obj, event)
+
+    def _move_highlight(self, direction):
+        if not self._filtered:
+            return
+        self._highlighted_row = (self._highlighted_row + direction) % len(self._filtered)
+        self.results_list.setCurrentRow(self._highlighted_row)
 
 
 # ====================================================================
@@ -422,13 +754,8 @@ class SalesTerminalManagementView(QWidget):
         self.barcode_scan_input.returnPressed.connect(self.handle_instant_barcode_scan)
         form.addRow("Barcode Quick Scan:", self.barcode_scan_input)
 
-        self.prod_combo = QComboBox()
-        self.prod_combo.setEditable(True)
-        self.prod_combo.setInsertPolicy(QComboBox.NoInsert)
-        if self.prod_combo.completer():
-            self.prod_combo.completer().setFilterMode(Qt.MatchContains)
-            self.prod_combo.completer().setCaseSensitivity(Qt.CaseInsensitive)
-        form.addRow("Search / Add Item:", self.prod_combo)
+        self.product_search = ProductSearchWidget()
+        form.addRow("Search / Add Item:", self.product_search)
 
         self.qty_input = QSpinBox()
         self.qty_input.setRange(1, 9999)
@@ -586,10 +913,9 @@ class SalesTerminalManagementView(QWidget):
     # ------------------------------------------------------------------
 
     def reload_terminal_combos(self):
-        self.prod_combo.clear()
         self.cust_combo.clear()
-
         self.cust_combo.addItem("Anonymous Walk-in Customer Guest Account", 0)
+
         try:
             for c in self.db_session.query(Customer).order_by(Customer.name.asc()).all():
                 self.cust_combo.addItem(c.name, c.id)
@@ -600,14 +926,20 @@ class SalesTerminalManagementView(QWidget):
                 .order_by(Product.name.asc())
                 .all()
             )
+
+            product_dicts = []
             for p in active_products:
                 product_price = getattr(p, "selling_price", 0.00)
                 price_display = float(product_price) if product_price is not None else 0.00
-                self.prod_combo.addItem(
-                    f"{p.name} [BC: {p.barcode}] (Stock: {p.quantity} | ${price_display:.2f})",
-                    p.id,
-                )
-            self.prod_combo.setCurrentIndex(-1)
+                product_dicts.append({
+                    "id": p.id,
+                    "name": p.name,
+                    "barcode": p.barcode,
+                    "quantity": p.quantity,
+                    "price": price_display,
+                })
+
+            self.product_search.set_products(product_dicts)
         except Exception as e:
             self.db_session.rollback()
             QMessageBox.warning(self, "Pipeline Error", f"Sync fail context error: {e}")
@@ -662,12 +994,11 @@ class SalesTerminalManagementView(QWidget):
             QMessageBox.critical(self, "Scan Processing Error", f"Error in scanning pipeline: {e}")
 
     def add_item_to_cart_cache(self, *args):
-        target_idx = self.prod_combo.currentIndex()
-        if target_idx < 0:
-            QMessageBox.warning(self, "Selection Missing", "Please select a product before adding.")
+        p_id = self.product_search.selected_product_id()
+        if p_id is None:
+            QMessageBox.warning(self, "Selection Missing", "Please search and select a product before adding.")
             return
 
-        p_id = self.prod_combo.itemData(target_idx)
         product = self.db_session.query(Product).filter(Product.id == p_id).first()
         qty = self.qty_input.value()
 
@@ -697,6 +1028,11 @@ class SalesTerminalManagementView(QWidget):
             "unit_price": float(resolved_price) if resolved_price is not None else 0.00,
         })
         self.redraw_cart_table()
+
+        # Reset for the next lookup so the cashier can keep moving quickly.
+        self.product_search.clear_selection()
+        self.qty_input.setValue(1)
+        self.product_search.search_input.setFocus()
 
     def handle_cart_cell_changed(self, row, column):
         if column not in (1, 2):

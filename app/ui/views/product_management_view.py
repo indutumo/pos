@@ -1,13 +1,15 @@
 # app/ui/views/product_management_view.py
 import csv
+import math
 from PySide6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QPushButton, 
-                             QTableWidget, QTableWidgetItem, QHeaderView, 
-                             QDialog, QLabel, QLineEdit, QComboBox, QMessageBox, 
-                             QAbstractItemView, QFileDialog, QTextEdit, QSpinBox, QDoubleSpinBox)
+                               QTableWidget, QTableWidgetItem, QHeaderView, 
+                               QDialog, QLabel, QLineEdit, QComboBox, QMessageBox, 
+                               QAbstractItemView, QFileDialog, QTextEdit, QSpinBox, QDoubleSpinBox)
 from PySide6.QtCore import Qt, QMarginsF 
 from PySide6.QtGui import QPdfWriter, QTextDocument, QPageLayout, QPageSize
 from app.services.product_service import ProductService
 from app.models.schema import ProductStatus
+
 
 class ProductFormDialog(QDialog):
     def __init__(self, parent, product_service: ProductService, current_user, product_to_edit=None):
@@ -151,12 +153,18 @@ class ProductManagementView(QWidget):
     def __init__(self, current_user, db_session):
         super().__init__()
         self.current_user = current_user
-        self.db_session = db_session  # FIXED: Retain explicit reference to manage caching layers
+        self.db_session = db_session  
         
         from app.repositories.product_repo import ProductRepository
         self.repo = ProductRepository(db_session)
         self.service = ProductService(self.repo)
         
+        # Pagination State
+        self.current_page = 1
+        self.items_per_page = 25  # Set your desired items per page here
+        self.total_pages = 1
+        self.total_items = 0
+
         self.init_ui()
         self.reload_product_records()
         self.evaluate_security_clearance_locks()
@@ -172,6 +180,7 @@ class ProductManagementView(QWidget):
             QPushButton#actionBtn:hover { background-color: #008c95; }
             QPushButton#secondaryBtn { background-color: #ffffff; color: #4a5568; border: 1px solid #ccd1d9; font-weight: bold; padding: 10px 16px; border-radius: 4px; }
             QPushButton#secondaryBtn:hover { background-color: #edf2f7; }
+            QPushButton#secondaryBtn:disabled { background-color: #f1f3f5; color: #a0aec0; border: 1px solid #e2e8f0; }
             QPushButton#inlineEditBtn { background-color: #00adb5; color: white; border: none; padding: 4px 12px; font-weight: bold; font-size: 11px; border-radius: 3px; min-height: 20px; }
         """)
 
@@ -180,22 +189,22 @@ class ProductManagementView(QWidget):
         main_layout.setSpacing(15)
 
         top_bar = QHBoxLayout()
-        title = QLabel("Global Product Inventory Catalog")
+        title = QLabel("Inventory Catalog")
         title.setStyleSheet("font-size: 20px; font-weight: bold; color: #2b2d42;")
         top_bar.addWidget(title)
         top_bar.addStretch()
 
-        self.add_product_btn = QPushButton("Catalog New Product")
+        self.add_product_btn = QPushButton("+ New Product")
         self.add_product_btn.setObjectName("actionBtn")
         self.add_product_btn.clicked.connect(self.launch_creation_form)
         top_bar.addWidget(self.add_product_btn)
 
-        self.export_excel_btn = QPushButton("Export to Excel")
+        self.export_excel_btn = QPushButton("Excel")
         self.export_excel_btn.setObjectName("secondaryBtn")
         self.export_excel_btn.clicked.connect(self.export_to_excel_format)
         top_bar.addWidget(self.export_excel_btn)
 
-        self.export_pdf_btn = QPushButton("Export to PDF Document")
+        self.export_pdf_btn = QPushButton("PDF")
         self.export_pdf_btn.setObjectName("secondaryBtn")
         self.export_pdf_btn.clicked.connect(self.export_to_pdf_format)
         top_bar.addWidget(self.export_pdf_btn)
@@ -205,7 +214,9 @@ class ProductManagementView(QWidget):
         search_layout = QHBoxLayout()
         self.search_input = QLineEdit()
         self.search_input.setPlaceholderText("Live Search Matrix: Enter product name or scan physical barcode token...")
-        self.search_input.textChanged.connect(self.reload_product_records)
+        
+        # Reset to page 1 whenever search text changes
+        self.search_input.textChanged.connect(self.reset_pagination_and_reload)
         search_layout.addWidget(self.search_input)
         main_layout.addLayout(search_layout)
 
@@ -222,39 +233,97 @@ class ProductManagementView(QWidget):
         
         main_layout.addWidget(self.table)
 
+        # ==========================================
+        # NEW: Pagination Controls Layout
+        # ==========================================
+        pagination_layout = QHBoxLayout()
+        
+        self.prev_btn = QPushButton("◄ Previous")
+        self.prev_btn.setObjectName("secondaryBtn")
+        self.prev_btn.clicked.connect(self.go_to_prev_page)
+        
+        self.page_info_label = QLabel("Page 1 of 1")
+        self.page_info_label.setAlignment(Qt.AlignCenter)
+        self.page_info_label.setStyleSheet("font-weight: bold; color: #4a5568;")
+        
+        self.next_btn = QPushButton("Next ►")
+        self.next_btn.setObjectName("secondaryBtn")
+        self.next_btn.clicked.connect(self.go_to_next_page)
+
+        pagination_layout.addStretch()
+        pagination_layout.addWidget(self.prev_btn)
+        pagination_layout.addWidget(self.page_info_label)
+        pagination_layout.addWidget(self.next_btn)
+        pagination_layout.addStretch()
+        
+        main_layout.addLayout(pagination_layout)
+
     def has_mutation_privilege(self) -> bool:
-        """Helper to determine if the active operator role has data modification rights."""
         ALLOWED_MUTATION_ROLES = ["ADMIN", "STORE_MANAGER", "MANAGE_STOCK"]
         return self.current_user and self.current_user.role.role_name in ALLOWED_MUTATION_ROLES
 
     def evaluate_security_clearance_locks(self):
-        """Hides form action items and column rows from low-clearance view profiles (e.g., Cashiers)."""
         if not self.has_mutation_privilege():
             self.add_product_btn.setVisible(False)
             self.add_product_btn.setEnabled(False)
             self.table.setColumnHidden(7, True)
 
-    # ====================================================================
-    # FIXED: Added native visibility handler for tab switches
-    # ====================================================================
     def showEvent(self, event):
-        """Forces an automatic data pull whenever the screen transitions to visible."""
         super().showEvent(event)
         self.reload_product_records()
 
+    # ==========================================
+    # NEW: Pagination Navigation Methods
+    # ==========================================
+    def reset_pagination_and_reload(self):
+        self.current_page = 1
+        self.reload_product_records()
+
+    def go_to_prev_page(self):
+        if self.current_page > 1:
+            self.current_page -= 1
+            self.reload_product_records()
+
+    def go_to_next_page(self):
+        if self.current_page < self.total_pages:
+            self.current_page += 1
+            self.reload_product_records()
+
+    def update_pagination_ui(self):
+        """Updates the state of pagination labels and buttons."""
+        self.page_info_label.setText(f"Page {self.current_page} of {self.total_pages} (Total: {self.total_items})")
+        self.prev_btn.setEnabled(self.current_page > 1)
+        self.next_btn.setEnabled(self.current_page < self.total_pages)
+
     def reload_product_records(self):
         try:
-            # ================================================================
-            # FIXED: Expire stale ORM cache values to load clean database realities
-            # ================================================================
             if self.db_session:
                 self.db_session.expire_all()
 
             self.table.setRowCount(0)
             search_query = self.search_input.text()
-            products = self.service.get_products_list(search_query)
             
-            for row_idx, prod in enumerate(products):
+            # Fetch all matching records 
+            all_products = self.service.get_products_list(search_query)
+            
+            # Pagination Math
+            self.total_items = len(all_products)
+            self.total_pages = math.ceil(self.total_items / self.items_per_page)
+            if self.total_pages == 0:
+                self.total_pages = 1
+                
+            # Prevent out-of-bounds pages if data is deleted or heavily filtered
+            if self.current_page > self.total_pages:
+                self.current_page = self.total_pages
+
+            # Slice the current page's data
+            start_idx = (self.current_page - 1) * self.items_per_page
+            end_idx = start_idx + self.items_per_page
+            paged_products = all_products[start_idx:end_idx]
+
+            self.update_pagination_ui()
+            
+            for row_idx, prod in enumerate(paged_products):
                 self.table.insertRow(row_idx)
                 
                 id_item = QTableWidgetItem(str(prod.id))
@@ -418,6 +487,7 @@ class ProductManagementView(QWidget):
             writer.setPageLayout(QPageLayout(QPageSize(QPageSize.A4), QPageLayout.Portrait, QMarginsF(15, 15, 15, 15)))
 
             document.print_(writer)
-            QMessageBox.information(self, "Export Complete", "Vector report document successfully exported.")
+            QMessageBox.information(self, "Export Complete", "PDF document output generated cleanly.")
+            
         except Exception as e:
-            QMessageBox.critical(self, "Export Failure", f"Unable to finalize vector pipeline layer composition: {e}")
+            QMessageBox.critical(self, "Export Failure", f"Unable to generate PDF document: {e}")

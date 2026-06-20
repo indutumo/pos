@@ -1,38 +1,27 @@
 # app/services/customer_service.py
-from app.models.schema import Customer
-from app.repositories.customer_repo import CustomerRepository
 
 class CustomerService:
-    def __init__(self, customer_repo: CustomerRepository):
-        self.customer_repo = customer_repo
+    def __init__(self, repository):
+        self.repo = repository
 
-    def get_customers_list(self, search_query: str = None):
-        if search_query and search_query.strip():
-            return self.customer_repo.search(search_query.strip())
-        return self.customer_repo.get_all()
+    def get_total_count(self, search_query: str = "") -> int:
+        """Returns the total number of customer records matching the search query."""
+        return self.repo.get_total_count(search_query)
 
-    def create_customer(self, name: str, mobile_number: str, email: str) -> Customer:
-        if not name.strip():
-            raise ValueError("Validation Error: Customer profile Name is a required field.")
-        
-        new_customer = Customer(
-            name=name.strip(),
-            mobile_number=mobile_number.strip() if mobile_number else None,
-            email=email.strip() if email else None
-        )
-        return self.customer_repo.add(new_customer)
+    def get_customers_paginated(self, search_query: str = "", limit: int = 30, offset: int = 0):
+        """Returns a specific slice of customer records for pagination."""
+        return self.repo.get_customers_paginated(search_query, limit, offset)
 
-    def update_customer(self, customer_id: int, name: str, mobile_number: str, email: str) -> Customer:
-        target_customer = self.customer_repo.get_by_id(customer_id)
-        if not target_customer:
-            raise ValueError("Data Missing: Selected customer profile could not be found.")
+    def get_customers_list(self, search_query: str = ""):
+        """Returns all customers (used for Excel/PDF exports)."""
+        return self.repo.get_all(search_query)
 
-        if not name.strip():
-            raise ValueError("Validation Error: Customer profile Name cannot be left empty.")
+    def create_customer(self, name: str, mobile_number: str, email: str):
+        if not name:
+            raise ValueError("Customer name is required.")
+        return self.repo.create(name=name, mobile_number=mobile_number, email=email)
 
-        target_customer.name = name.strip()
-        target_customer.mobile_number = mobile_number.strip() if mobile_number else None
-        target_customer.email = email.strip() if email else None
-        
-        self.customer_repo.commit()
-        return target_customer
+    def update_customer(self, customer_id: int, name: str, mobile_number: str, email: str):
+        if not name:
+            raise ValueError("Customer name is required.")
+        return self.repo.update(customer_id, name=name, mobile_number=mobile_number, email=email)
