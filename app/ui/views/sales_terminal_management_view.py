@@ -18,7 +18,7 @@ from PySide6.QtPrintSupport import QPrinter, QPrintDialog
 from app.repositories.sales_repo import SalesRepository, PAGE_SIZE
 from app.services.sales_service import SalesService
 from app.models.schema import Product, Customer, Payment, PaymentMethod
-
+from app.repositories.org_repo import OrganizationRepository
 
 # ====================================================================
 # Reusable Pagination Bar Widget
@@ -80,7 +80,6 @@ class PaginationBar(QWidget):
             if self._callback:
                 self._callback()
 
-    # Reset to page 1 (e.g. when the search text changes)
     def reset(self):
         self.current_page = 1
 
@@ -91,28 +90,10 @@ class PaginationBar(QWidget):
 class ProductSearchWidget(QWidget):
     """
     A modern, type-ahead product picker.
-
-    The user types a few characters of a product's name or barcode and
-    is shown a live-filtered popup of matches. Each row displays the
-    product name, barcode, a colour-coded stock badge, and price, so
-    the cashier can confirm availability without leaving the field.
-
-    Usage:
-        self.product_search = ProductSearchWidget()
-        self.product_search.set_products(product_dicts)
-        self.product_search.productSelected.connect(self.on_product_picked)
-        ...
-        product_id = self.product_search.selected_product_id()
-
-    `product_dicts` is a list of dicts shaped like:
-        {"id": ..., "name": ..., "barcode": ..., "quantity": ..., "price": ...}
     """
 
-    productSelected = Signal(object)  # emits product_id, or None when cleared
+    productSelected = Signal(object)
     LOW_STOCK_THRESHOLD = 5
-    # Soft cap purely to protect rendering performance on huge catalogues —
-    # the popup itself grows to fit every match with no inner scrolling
-    # as long as it fits on screen (see _show_popup).
     MAX_RESULTS = 100
 
     def __init__(self, parent=None):
@@ -145,9 +126,13 @@ class ProductSearchWidget(QWidget):
         layout.addWidget(self.selection_lbl)
 
     def _build_popup(self):
-        # A frameless, top-level popup positioned under the search field.
-        # Qt.Popup automatically closes itself on an outside click or Escape.
-        self.popup = QFrame(None, Qt.Popup)
+        # Include FramelessWindowHint to ensure clean popup behavior
+        self.popup = QFrame(self, Qt.ToolTip | Qt.FramelessWindowHint)
+
+        self.popup.setWindowFlag(Qt.WindowDoesNotAcceptFocus, True)
+        self.popup.setFocusPolicy(Qt.NoFocus)
+        self.popup.setAttribute(Qt.WA_ShowWithoutActivating, True)
+        self.popup.setAttribute(Qt.WA_TransparentForMouseEvents, False)
         self.popup.setObjectName("ProductSearchPopup")
         self.popup.setStyleSheet("""
             #ProductSearchPopup {
@@ -187,7 +172,6 @@ class ProductSearchWidget(QWidget):
     # Public API
     # ------------------------------------------------------------------
     def set_products(self, products):
-        """Load/refresh the searchable catalogue and reset any selection."""
         self._all_products = products
         self.clear_selection()
 
@@ -303,10 +287,15 @@ class ProductSearchWidget(QWidget):
     # Popup show / hide / position
     # ------------------------------------------------------------------
     def _show_popup(self):
-        anchor_bottom = self.search_input.mapToGlobal(self.search_input.rect().bottomLeft())
-        anchor_top = self.search_input.mapToGlobal(self.search_input.rect().topLeft())
+        anchor_bottom = self.search_input.mapToGlobal(
+            self.search_input.rect().bottomLeft()
+        )
+        anchor_top = self.search_input.mapToGlobal(
+            self.search_input.rect().topLeft()
+        )
+
         width = max(self.search_input.width(), 320)
-        self.popup.setFixedWidth(width)
+        self.popup.resize(width, self.popup.height())
 
         row_count = len(self._filtered)
         content_height = (56 * row_count) + 16 if self._filtered else 60
@@ -314,43 +303,38 @@ class ProductSearchWidget(QWidget):
         screen = self.search_input.screen()
         screen_rect = screen.availableGeometry() if screen else None
 
-        if screen_rect is None:
-            # No screen info yet (widget not realized) — just show every
-            # row below the field at full height.
-            self.results_list.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-            self.popup.setFixedHeight(content_height)
-            self.popup.move(anchor_bottom)
-            self.popup.show()
-            self.popup.raise_()
-            return
+        if screen_rect:
+            space_below = screen_rect.bottom() - anchor_bottom.y()
+            space_above = anchor_top.y() - screen_rect.top()
 
-        space_below = screen_rect.bottom() - anchor_bottom.y()
-        space_above = anchor_top.y() - screen_rect.top()
-        show_below = content_height <= space_below or space_below >= space_above
+            show_below = (
+                content_height <= space_below
+                or space_below >= space_above
+            )
 
-        if show_below:
-            final_height = min(content_height, max(space_below - 8, 60))
-            target_pos = anchor_bottom
+            if show_below:
+                final_height = min(content_height, max(space_below - 8, 60))
+                pos = anchor_bottom
+            else:
+                final_height = min(content_height, max(space_above - 8, 60))
+                pos = anchor_top - QPoint(0, final_height)
+
+            self.popup.resize(width, final_height)
+            self.popup.move(pos)
         else:
-            # Not enough room below the field — flip the popup above it
-            # instead of cramming results into a tiny scrollable strip.
-            final_height = min(content_height, max(space_above - 8, 60))
-            target_pos = anchor_top - QPoint(0, final_height)
+            self.popup.resize(width, content_height)
+            self.popup.move(anchor_bottom)
 
-        # Only fall back to an inner scrollbar if even the full screen
-        # can't fit every match — otherwise every row is shown at once.
-        fits_without_scroll = final_height >= content_height
-        self.results_list.setVerticalScrollBarPolicy(
-            Qt.ScrollBarAlwaysOff if fits_without_scroll else Qt.ScrollBarAsNeeded
-        )
-
-        self.popup.setFixedHeight(final_height)
-        self.popup.move(target_pos)
         self.popup.show()
+
+        # IMPORTANT
         self.popup.raise_()
+        self.search_input.setFocus(Qt.OtherFocusReason)
+        self.search_input.activateWindow()
 
     def _hide_popup(self):
-        self.popup.hide()
+        if hasattr(self, "popup") and self.popup:
+            self.popup.hide()
 
     # ------------------------------------------------------------------
     # Selection handling
@@ -370,7 +354,6 @@ class ProductSearchWidget(QWidget):
         self.search_input.blockSignals(True)
         self.search_input.setText(product["name"])
         self.search_input.blockSignals(False)
-        self.search_input.selectAll()
         self._hide_popup()
 
         bg, fg, _ = self._stock_badge_style(product["quantity"])
@@ -383,29 +366,42 @@ class ProductSearchWidget(QWidget):
     # Keyboard navigation (Up / Down / Enter / Escape)
     # ------------------------------------------------------------------
     def eventFilter(self, obj, event):
-        if obj is self.search_input and event.type() == QEvent.FocusIn:
-            # Select all existing text on focus: typing replaces it to
-            # continue/refine the search, and Backspace/Delete clears it
-            # in a single press, rather than needing manual select-all first.
-            QTimer.singleShot(0, self.search_input.selectAll)
-            return False
 
-        if obj is self.search_input and event.type() == QEvent.KeyPress:
-            key = event.key()
+        if obj is self.search_input:
 
-            if key in (Qt.Key_Down, Qt.Key_Up) and self.popup.isVisible() and self._filtered:
-                self._move_highlight(1 if key == Qt.Key_Down else -1)
-                return True
+            if event.type() == QEvent.FocusOut:
+                if self.popup.isVisible():
+                    QTimer.singleShot(
+                        0,
+                        lambda: self.search_input.setFocus(
+                            Qt.OtherFocusReason
+                        )
+                    )
+                return False
 
-            if key in (Qt.Key_Return, Qt.Key_Enter):
-                if self.popup.isVisible() and self._filtered:
-                    row = self._highlighted_row if self._highlighted_row >= 0 else 0
-                    self._select_product(self._filtered[row])
+            if event.type() == QEvent.KeyPress:
+                key = event.key()
+
+                if key in (Qt.Key_Down, Qt.Key_Up):
+                    if self.popup.isVisible() and self._filtered:
+                        self._move_highlight(
+                            1 if key == Qt.Key_Down else -1
+                        )
+                        return True
+
+                if key in (Qt.Key_Return, Qt.Key_Enter):
+                    if self.popup.isVisible() and self._filtered:
+                        row = (
+                            self._highlighted_row
+                            if self._highlighted_row >= 0
+                            else 0
+                        )
+                        self._select_product(self._filtered[row])
+                        return True
+
+                if key == Qt.Key_Escape:
+                    self._hide_popup()
                     return True
-
-            if key == Qt.Key_Escape and self.popup.isVisible():
-                self._hide_popup()
-                return True
 
         return super().eventFilter(obj, event)
 
@@ -419,12 +415,16 @@ class ProductSearchWidget(QWidget):
 # ====================================================================
 # Printer Helper Function
 # ====================================================================
-def print_thermal_receipt(parent_widget, receipt_obj):
-    """Generates an HTML document optimised for a thermal printer and triggers the print dialog."""
-
-    org_name = "Zola POS Terminal"
-    org_location = "Nairobi, Kenya"
-    org_mobile = "+254 700 000 000"
+def print_thermal_receipt(parent_widget, receipt_obj, db_session):
+    # 1. Fetch dynamic organization data
+    org_repo = OrganizationRepository(db_session)
+    org = org_repo.get_profile()
+    
+    # 2. Extract values with fallbacks
+    org_name = org.name or "Zola POS"
+    org_address = org.address or "Nairobi, Kenya"
+    org_mobile = org.phone or ""
+    org_kra = org.kra_pin or ""
 
     date_str = receipt_obj.receipt_date.strftime("%Y-%m-%d %H:%M") if receipt_obj.receipt_date else "N/A"
     customer_name = receipt_obj.customer.name if receipt_obj.customer else "Walk-in Guest"
@@ -448,8 +448,9 @@ def print_thermal_receipt(parent_widget, receipt_obj):
     <body>
         <div class="center">
             <h2>{org_name}</h2>
-            <p>{org_location}</p>
+            <p>{org_address}</p>
             <p>Tel: {org_mobile}</p>
+            <p>PIN: {org_kra}</p>
         </div>
         <div class="divider"></div>
         <div class="left">
@@ -504,14 +505,14 @@ def print_thermal_receipt(parent_widget, receipt_obj):
     if dialog.exec() == QDialog.Accepted:
         document.print_(printer)
 
-
 # ====================================================================
 # Receipt Details Dialog
 # ====================================================================
 class ReceiptDetailsDialog(QDialog):
-    def __init__(self, parent, receipt_obj):
+    def __init__(self, parent, receipt_obj, db_session):
         super().__init__(parent)
         self.receipt_obj = receipt_obj
+        self.db_session = db_session # Store the session here
         self.setWindowTitle(f"Invoice breakdown: {receipt_obj.receipt_number}")
         self.setMinimumSize(600, 450)
 
@@ -566,7 +567,8 @@ class ReceiptDetailsDialog(QDialog):
         layout.addLayout(btn_box)
 
     def trigger_print(self):
-        print_thermal_receipt(self, self.receipt_obj)
+        # Now passing the session to the printer
+        print_thermal_receipt(self, self.receipt_obj, self.db_session)
 
 
 # ====================================================================
@@ -702,7 +704,6 @@ class SalesTerminalManagementView(QWidget):
         self.service = SalesService(self.repo)
         self.active_cart = []
 
-        # Per-tab page trackers (managed by PaginationBar)
         self._receipt_page = 1
         self._sales_page = 1
         self._payments_page = 1
@@ -806,7 +807,12 @@ class SalesTerminalManagementView(QWidget):
         self.receipt_search.setPlaceholderText(
             "Filter receipts by invoice number or customer name..."
         )
-        # Reset to page 1 whenever the search text changes
+        
+        self.receipt_search_timer = QTimer(self)
+        self.receipt_search_timer.setSingleShot(True)
+        self.receipt_search_timer.setInterval(300)
+        self.receipt_search_timer.timeout.connect(self._trigger_receipt_search)
+        
         self.receipt_search.textChanged.connect(self._on_receipt_search_changed)
         search_box.addWidget(self.receipt_search)
         layout.addLayout(search_box)
@@ -822,7 +828,6 @@ class SalesTerminalManagementView(QWidget):
         self.receipt_table.doubleClicked.connect(self.inspect_selected_receipt)
         layout.addWidget(self.receipt_table)
 
-        # Pagination bar
         self.receipt_pager = PaginationBar()
         self.receipt_pager.set_callback(self.refresh_receipts_register)
         layout.addWidget(self.receipt_pager)
@@ -838,6 +843,12 @@ class SalesTerminalManagementView(QWidget):
         search_box = QHBoxLayout()
         self.sales_search = QLineEdit()
         self.sales_search.setPlaceholderText("Filter item logs by product name...")
+        
+        self.sales_search_timer = QTimer(self)
+        self.sales_search_timer.setSingleShot(True)
+        self.sales_search_timer.setInterval(300)
+        self.sales_search_timer.timeout.connect(self._trigger_sales_search)
+        
         self.sales_search.textChanged.connect(self._on_sales_search_changed)
         search_box.addWidget(self.sales_search)
         layout.addLayout(search_box)
@@ -883,14 +894,20 @@ class SalesTerminalManagementView(QWidget):
         self.tabs.addTab(page, "Payments List")
 
     # ------------------------------------------------------------------
-    # Search-changed helpers (reset page → reload)
+    # Search-changed helpers (Timer debounced)
     # ------------------------------------------------------------------
 
-    def _on_receipt_search_changed(self):
+    def _on_receipt_search_changed(self, *args):
+        self.receipt_search_timer.start()
+
+    def _trigger_receipt_search(self):
         self.receipt_pager.reset()
         self.refresh_receipts_register()
 
-    def _on_sales_search_changed(self):
+    def _on_sales_search_changed(self, *args):
+        self.sales_search_timer.start()
+
+    def _trigger_sales_search(self):
         self.sales_pager.reset()
         self.refresh_sales_history()
 
@@ -1029,7 +1046,6 @@ class SalesTerminalManagementView(QWidget):
         })
         self.redraw_cart_table()
 
-        # Reset for the next lookup so the cashier can keep moving quickly.
         self.product_search.clear_selection()
         self.qty_input.setValue(1)
         self.product_search.search_input.setFocus()
@@ -1157,7 +1173,8 @@ class SalesTerminalManagementView(QWidget):
                     QMessageBox.Yes | QMessageBox.No, QMessageBox.Yes,
                 )
                 if reply == QMessageBox.Yes:
-                    print_thermal_receipt(self, full_receipt_obj)
+                    # Pass self.db_session here
+                    print_thermal_receipt(self, full_receipt_obj, self.db_session)
 
             self.active_cart = []
             self.redraw_cart_table()
@@ -1208,7 +1225,8 @@ class SalesTerminalManagementView(QWidget):
         receipt_id = target_item.data(Qt.UserRole)
         receipt_obj = self.service.get_receipt_details(receipt_id)
         if receipt_obj:
-            dialog = ReceiptDetailsDialog(self, receipt_obj)
+            # Pass self.db_session to the dialog
+            dialog = ReceiptDetailsDialog(self, receipt_obj, self.db_session)
             dialog.exec()
 
     # ------------------------------------------------------------------

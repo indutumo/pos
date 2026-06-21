@@ -1,3 +1,5 @@
+import os
+from PySide6.QtGui import QIcon
 from PySide6.QtWidgets import (
     QMainWindow, QWidget, QHBoxLayout, QVBoxLayout, 
     QPushButton, QLabel, QStackedWidget, QStatusBar
@@ -12,6 +14,8 @@ from app.ui.views.customer_management_view import CustomerManagementView
 from app.ui.views.stocktake_management_view import StockTakeManagementView 
 from app.ui.views.sales_terminal_management_view import SalesTerminalManagementView 
 from app.ui.views.shift_management_view import ShiftManagementView
+from app.ui.views.analytics_reports_view import AnalyticsReportsView
+from app.ui.views.org_settings_view import OrganizationSettingsView
 
 from app.core.database import SessionLocal
 
@@ -19,6 +23,13 @@ class DashboardWindow(QMainWindow):
     def __init__(self, user):
         super().__init__()
         self.user = user
+        
+        base_dir = os.getcwd()
+        icon_path = os.path.join(base_dir, "assets", "logo.ico")
+        
+        if os.path.exists(icon_path):
+            self.setWindowIcon(QIcon(icon_path))
+
         self.db_session = SessionLocal() 
         self.setWindowTitle(f"Zola POS Core Enterprise Suite: {self.user.username}")
         self.resize(1150, 750)
@@ -63,7 +74,8 @@ class DashboardWindow(QMainWindow):
             ("Customer Manager", ["ADMIN", "CASHIER", "MANAGE_STOCK"]),  
             ("Stock Take Audit", ["ADMIN", "MANAGE_STOCK"]),
             ("Analytics & Reports", ["ADMIN"]),
-            ("System Users", ["ADMIN"]), 
+            ("System Users", ["ADMIN"]),
+            ("Organization Settings", ["ADMIN"]), 
         ]
 
         user_role_str = self.user.role.role_name
@@ -113,6 +125,11 @@ class DashboardWindow(QMainWindow):
                 workspace_page = SalesTerminalManagementView(self.user, self.db_session)
             elif view_title == "Shift Ledger":
                 workspace_page = ShiftManagementView(self.user, self.db_session)
+            elif view_title == "Analytics & Reports":
+                workspace_page = AnalyticsReportsView(self.user, self.db_session)
+            elif view_title == "Organization Settings":
+                # FIXED: Passed self.user so the Admin check works!
+                workspace_page = OrganizationSettingsView(self.user, self.db_session)
             else:
                 workspace_page = QWidget()
                 lbl_layout = QVBoxLayout(workspace_page)
@@ -129,9 +146,16 @@ class DashboardWindow(QMainWindow):
 
         # Status Footer
         self.status_bar = QStatusBar()
-        self.status_bar.setStyleSheet("color: #4a5568; background-color: #ffffff; border-top: 1px solid #e1e4e8;")
+        self.status_bar.setStyleSheet("background-color: #ffffff; border-top: 1px solid #e1e4e8; padding: 2px 10px;")
         self.setStatusBar(self.status_bar)
-        self.status_bar.showMessage(f"Operator: {self.user.name} | Security clearance level: [{user_role_str}]")
+
+        operator_info = QLabel(f"User: {self.user.name} | User Role: [{user_role_str}]")
+        operator_info.setStyleSheet("color: #4a5568; font-weight: bold; font-size: 12px;")
+        self.status_bar.addWidget(operator_info)
+
+        branding_label = QLabel("Design and developed by Zola Technologies Limited | +254735296707")
+        branding_label.setStyleSheet("color: #0018F9; font-size: 12px; font-weight: bold; padding-right: 10px;")
+        self.status_bar.addPermanentWidget(branding_label)
 
         if self.menu_buttons:
             list(self.menu_buttons.values())[0].setChecked(True)

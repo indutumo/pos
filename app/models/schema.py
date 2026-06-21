@@ -205,3 +205,13 @@ class Shift(Base):
     created_at = Column(DateTime, default=datetime.utcnow)
 
     user = relationship("User", back_populates="shifts")
+
+
+class OrganizationProfile(Base):
+    __tablename__ = 'organization_profile'
+    
+    id = Column(Integer, primary_key=True, default=1) # Single row pattern
+    name = Column(String, default="My Business Name")
+    address = Column(String, default="123 Street, City")
+    phone = Column(String, default="0700 000 000")
+    kra_pin = Column(String, default="P000000000X")

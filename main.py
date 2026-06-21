@@ -1,7 +1,6 @@
 import sys
 from PySide6.QtWidgets import QApplication
 from app.ui.views.login_view import LoginWindow
-#from app.ui.views.dashboard_view import DashboardWindow
 from app.ui.views.dashboard_window import DashboardWindow
 
 class MainApplicationController:
